@@ -466,6 +466,11 @@ type JobInfo struct {
 	TaskMinAvailable      map[string]int32 // key is value of "volcano.sh/task-spec", value is number
 	TaskMinAvailableTotal int32
 
+	// Readiness aggregates are initialized on first use and maintained by the
+	// task index mutations. Clones rebuild them from their own tasks.
+	readyTaskRoles    map[string]int32
+	pendingBestEffort *int32
+
 	Allocated    *Resource
 	TotalRequest *Resource
 
@@ -745,6 +750,10 @@ func (ji *JobInfo) GetElasticResources() *Resource {
 }
 
 func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
+	if old, found := ji.TaskStatusIndex[ti.Status][ti.UID]; found {
+		ji.updateReadinessCounts(old, -1)
+	}
+	ji.updateReadinessCounts(ti, 1)
 	if _, found := ji.TaskStatusIndex[ti.Status]; !found {
 		ji.TaskStatusIndex[ti.Status] = TasksMap{}
 	}
@@ -776,6 +785,9 @@ func (ji *JobInfo) UpdateTaskStatus(task *TaskInfo, status TaskStatus) {
 
 func (ji *JobInfo) deleteTaskIndex(ti *TaskInfo) {
 	if tasks, found := ji.TaskStatusIndex[ti.Status]; found {
+		if old, found := tasks[ti.UID]; found {
+			ji.updateReadinessCounts(old, -1)
+		}
 		delete(tasks, ti.UID)
 
 		if len(tasks) == 0 {
@@ -1018,13 +1030,15 @@ func (ji *JobInfo) WaitingTaskNum() int32 {
 }
 
 func (ji *JobInfo) PendingBestEffortTaskNum() int32 {
-	count := 0
-	for _, task := range ji.TaskStatusIndex[Pending] {
-		if task.BestEffort {
-			count++
+	if ji.pendingBestEffort == nil {
+		ji.pendingBestEffort = new(int32)
+		for _, task := range ji.TaskStatusIndex[Pending] {
+			if task.BestEffort {
+				*ji.pendingBestEffort++
+			}
 		}
 	}
-	return int32(count)
+	return *ji.pendingBestEffort
 }
 
 func (ji *JobInfo) AllocatedTaskNum() int32 {
@@ -1126,26 +1140,36 @@ func (ji *JobInfo) NeedContinueAllocating(subJobID SubJobID) bool {
 }
 
 // getJobAllocatedRoles returns result records each role's allocated number
+// The returned map is read-only to callers.
 func (ji *JobInfo) getJobAllocatedRoles() map[string]int32 {
-	occupiedMap := map[string]int32{}
-	for status, tasks := range ji.TaskStatusIndex {
-		if AllocatedStatus(status) ||
-			status == Succeeded {
+	if ji.readyTaskRoles == nil {
+		ji.readyTaskRoles = make(map[string]int32)
+		for status, tasks := range ji.TaskStatusIndex {
 			for _, task := range tasks {
-				occupiedMap[task.TaskRole]++
-			}
-			continue
-		}
-
-		if status == Pending {
-			for _, task := range tasks {
-				if task.InitResreq.IsEmpty() {
-					occupiedMap[task.TaskRole]++
+				if roleReady(status, task) {
+					ji.readyTaskRoles[task.TaskRole]++
 				}
 			}
 		}
 	}
-	return occupiedMap
+	return ji.readyTaskRoles
+}
+
+func roleReady(status TaskStatus, task *TaskInfo) bool {
+	return AllocatedStatus(status) || status == Succeeded ||
+		(status == Pending && task.InitResreq.IsEmpty())
+}
+
+func (ji *JobInfo) updateReadinessCounts(task *TaskInfo, delta int32) {
+	if ji.readyTaskRoles != nil && roleReady(task.Status, task) {
+		ji.readyTaskRoles[task.TaskRole] += delta
+		if ji.readyTaskRoles[task.TaskRole] == 0 {
+			delete(ji.readyTaskRoles, task.TaskRole)
+		}
+	}
+	if ji.pendingBestEffort != nil && task.Status == Pending && task.BestEffort {
+		*ji.pendingBestEffort += delta
+	}
 }
 
 // CheckTaskValid returns whether each task of job is valid.

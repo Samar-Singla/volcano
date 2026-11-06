@@ -50,6 +50,8 @@ type SubJobInfo struct {
 	Tasks           map[TaskID]*TaskInfo
 	TaskStatusIndex map[TaskStatus]TasksMap
 	taskPriorities  map[int32]sets.Set[TaskID]
+	// Initialized on first use; maintained by addTask and deleteTask.
+	pendingBestEffort *int32
 
 	AllocatedHyperNode string
 	// NominatedHyperNode is the hyperNode chosen by gangpreempt/gangreclaim
@@ -122,6 +124,14 @@ func (sji *SubJobInfo) ConvertToHardTopology(maxTier int) {
 }
 
 func (sji *SubJobInfo) addTask(ti *TaskInfo) {
+	if sji.pendingBestEffort != nil {
+		if old, found := sji.TaskStatusIndex[ti.Status][ti.UID]; found && old.Status == Pending && old.BestEffort {
+			*sji.pendingBestEffort--
+		}
+		if ti.Status == Pending && ti.BestEffort {
+			*sji.pendingBestEffort++
+		}
+	}
 	sji.Tasks[ti.UID] = ti
 
 	if _, found := sji.TaskStatusIndex[ti.Status]; !found {
@@ -142,6 +152,9 @@ func (sji *SubJobInfo) deleteTask(ti *TaskInfo) {
 	delete(sji.Tasks, ti.UID)
 
 	if tasks, found := sji.TaskStatusIndex[ti.Status]; found {
+		if old, found := tasks[ti.UID]; found && sji.pendingBestEffort != nil && old.Status == Pending && old.BestEffort {
+			*sji.pendingBestEffort--
+		}
 		delete(tasks, ti.UID)
 		if len(tasks) == 0 {
 			delete(sji.TaskStatusIndex, ti.Status)
@@ -257,13 +270,15 @@ func (sji *SubJobInfo) ReadyTaskNum() int32 {
 }
 
 func (sji *SubJobInfo) PendingBestEffortTaskNum() int32 {
-	count := 0
-	for _, task := range sji.TaskStatusIndex[Pending] {
-		if task.BestEffort {
-			count++
+	if sji.pendingBestEffort == nil {
+		sji.pendingBestEffort = new(int32)
+		for _, task := range sji.TaskStatusIndex[Pending] {
+			if task.BestEffort {
+				*sji.pendingBestEffort++
+			}
 		}
 	}
-	return int32(count)
+	return *sji.pendingBestEffort
 }
 
 // WaitingTaskNum returns the number of tasks that are pipelined.
